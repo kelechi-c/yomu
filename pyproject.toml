@@ -1,0 +1,18 @@
+[project]
+name = "yomu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aspose-words>=26.2.0",
+    "click>=8.1.8",
+    "dotenv>=0.9.9",
+    "fpdf2>=2.8.2",
+    "google-genai>=1.8.0",
+    "openai>=1.51.0",
+    "pillow>=11.1.0",
+    "pypdf>=5.3.1",
+    "pypdfium2>=4.30.0",
+    "streamlit>=1.43.0",
+]
