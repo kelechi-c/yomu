@@ -13,6 +13,10 @@ from openai import OpenAI
 from PIL import Image
 from pypdf import PdfReader
 import click
+try:
+    from .convert2pdf import convert_markdown_file_to_pdf
+except ImportError:
+    from convert2pdf import convert_markdown_file_to_pdf
 
 import dotenv
 
@@ -74,12 +78,6 @@ def _read_cached_ocr(path: Path) -> str | None:
         return None
     text = path.read_text(encoding="utf-8").strip()
     return text or None
-
-
-def _normalized_pdf_name(index: int, pdf_stem: str) -> str:
-    normalized_stem = re.sub(r"[^a-z0-9]+", "_", pdf_stem.lower()).strip("_")
-    normalized_stem = normalized_stem or "untitled"
-    return f"ex_{index:02d}_{normalized_stem}.pdf"
 
 
 @_latency_marker("native_text_extraction")
@@ -164,29 +162,18 @@ def _generate_output(client: OpenAI, model: str, prompt: str) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
+        extra_body={"reasoning": {"exclude": True, "enabled": False}},
     )
     return _completion_to_text(response)
 
 
 def _completion_to_text(response: Any) -> str:
     if not getattr(response, "choices", None):
-        return ""
+        raise ValueError("Model response is missing 'choices' field.")
+    
     message = response.choices[0].message
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    parts.append(str(text))
-            else:
-                text = getattr(item, "text", None)
-                if text:
-                    parts.append(str(text))
-        return "\n".join(parts).strip()
+    content = getattr(message, "content", None)
+
     return str(content).strip()
 
 
@@ -200,14 +187,6 @@ def _summary_to_markdown(title: str, content: str) -> str:
     lines: List[str] = [f"# {normalized_title}", ""]
     lines.extend(content.splitlines())
     return "\n".join(lines).rstrip() + "\n"
-
-
-@_latency_marker("md_to_pdf_aspose")
-def _convert_markdown_to_pdf_aspose(md_path: Path, pdf_path: Path) -> None:
-    import aspose.words as aw
-
-    doc = aw.Document(str(md_path))
-    doc.save(str(pdf_path), aw.SaveFormat.PDF)
 
 
 def _load_env_file_if_present(env_path: Path) -> None:
@@ -224,10 +203,11 @@ def _load_env_file_if_present(env_path: Path) -> None:
             os.environ[key] = value
 
 
-def _normalized_output_name(index: int, pdf_stem: str) -> str:
+def _normalized_output_name(pdf_stem: str, prompt_type: str) -> str:
     normalized_stem = re.sub(r"[^a-z0-9]+", "_", pdf_stem.lower()).strip("_")
     normalized_stem = normalized_stem or "untitled"
-    return f"ex_{index:02d}_{normalized_stem}.md"
+    prompt_suffix = re.sub(r"[^a-z0-9]+", "_", prompt_type.lower()).strip("_") or "output"
+    return f"{normalized_stem}_{prompt_suffix}.md"
 
 
 def _resolve_prompt_file(prompt_type: str, prompt_file: Path | None) -> Path:
@@ -295,7 +275,7 @@ def _output_title_for_prompt_type(prompt_type: str, source_name: str) -> str:
 )
 @click.option(
     "--ocr-threshold",
-    default=300,
+    default=5000,
     show_default=True,
     type=click.IntRange(min=0),
     help="If extracted native text length is below this, OCR fallback runs.",
@@ -316,14 +296,20 @@ def _output_title_for_prompt_type(prompt_type: str, source_name: str) -> str:
 @click.option(
     "--convert-md-to-pdf",
     is_flag=True,
-    default=False,
-    help="Optionally convert markdown outputs to PDF using aspose-words.",
+    default=True,
+    help="Also convert each generated markdown to PDF via convert2pdf.py.",
 )
 @click.option(
     "--pdf-output-dir",
     default=None,
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
-    help="Directory for converted PDFs. Defaults to --output-dir when conversion is enabled.",
+    help="Directory for converted PDFs. Defaults to --output-dir/pdfs.",
+)
+@click.option(
+    "--pdf-engine",
+    default="xelatex",
+    show_default=True,
+    help="Pandoc PDF engine used when --convert-md-to-pdf is set.",
 )
 @click.option(
     "--prompt-type",
@@ -361,6 +347,7 @@ def main(
     regenerate: bool,
     convert_md_to_pdf: bool,
     pdf_output_dir: Path | None,
+    pdf_engine: str,
     prompt_type: str,
     prompt_file: Path | None,
     difficulty: str,
@@ -379,15 +366,10 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     ocr_cache_dir = ocr_cache_dir.expanduser().resolve()
     ocr_cache_dir.mkdir(parents=True, exist_ok=True)
+    resolved_pdf_output_dir: Path | None = None
     if convert_md_to_pdf:
-        pdf_output_dir = (pdf_output_dir or output_dir).expanduser().resolve()
-        pdf_output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            import aspose.words as aw  # noqa: F401
-        except ImportError as exc:
-            raise click.ClickException(
-                "Missing dependency: aspose-words. Install it before using --convert-md-to-pdf."
-            ) from exc
+        resolved_pdf_output_dir = (pdf_output_dir or (output_dir / "pdfs")).expanduser().resolve()
+        resolved_pdf_output_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_prompt_file = _resolve_prompt_file(prompt_type.lower(), prompt_file)
     if not resolved_prompt_file.exists():
@@ -414,17 +396,18 @@ def main(
     click.echo(f"base url: {base_url or '(default openai)'}")
     click.echo(f"regenerate: {regenerate}")
     click.echo(f"convert md to pdf: {convert_md_to_pdf}")
+    if convert_md_to_pdf and resolved_pdf_output_dir is not None:
+        click.echo(f"pdf output path -> {resolved_pdf_output_dir}")
+        click.echo(f"pdf engine: {pdf_engine}")
     click.echo(f"prompt type: {prompt_type.lower()}")
     click.echo(f"prompt file: {resolved_prompt_file}")
     click.echo(f"difficulty: {difficulty.lower()}")
-    if convert_md_to_pdf and pdf_output_dir is not None:
-        click.echo(f"pdf output path -> {pdf_output_dir}")
 
     for idx, pdf_path in enumerate(pdf_paths, start=1):
         file_start = time.perf_counter()
         click.echo(f"\n[{idx}/{total}] preprocessing: {pdf_path.name}")
         try:
-            out_filename = _normalized_output_name(idx, pdf_path.stem)
+            out_filename = _normalized_output_name(pdf_path.stem, prompt_type.lower())
             out_path = output_dir / out_filename
             md_exists = out_path.exists()
             if md_exists and not regenerate:
@@ -441,18 +424,13 @@ def main(
                 
                 client = OpenAI(
                     api_key=api_key, base_url=base_url,
-                    extra_body={
-                        "reasoning": {
-                            "exclude": True
-                        }
-                    }    
                 )
 
                 pdf_bytes = _timed_call("read_pdf_bytes", pdf_path.read_bytes)
                 material_text = _extract_pdf_text(pdf_bytes)
 
                 if len(material_text) < ocr_threshold:
-                    click.echo("  native text is low; running OCR fallback with model...")
+                    click.echo("native text is low; running OCR fallback with model...")
                     cache_path = _ocr_cache_path(ocr_cache_dir, pdf_bytes, model, max_ocr_pages)
                     cached_ocr_text = _timed_call("ocr_cache_lookup", _read_cached_ocr, cache_path)
 
@@ -472,7 +450,7 @@ def main(
 
                 prompt = _build_prompt(prompt_template, material_text, difficulty.lower())
 
-                click.echo("  generating output with model...")
+                click.echo("generating output with model...")
                 summary_text = _generate_output(client, model, prompt)
                 if not summary_text:
                     raise ValueError("Model returned empty output.")
@@ -485,11 +463,17 @@ def main(
             if convert_md_to_pdf:
                 if not out_path.exists():
                     raise ValueError(f"Markdown file is not available for conversion: {out_path}")
-                pdf_filename = _normalized_pdf_name(idx, pdf_path.stem)
-                assert pdf_output_dir is not None
-                pdf_path_out = pdf_output_dir / pdf_filename
-                _convert_markdown_to_pdf_aspose(out_path, pdf_path_out)
-                click.echo(f"converted => {pdf_path_out}")
+                assert resolved_pdf_output_dir is not None
+                converted_path = resolved_pdf_output_dir / f"{out_path.stem}.pdf"
+                _timed_call(
+                    "md_to_pdf",
+                    convert_markdown_file_to_pdf,
+                    md_file=out_path,
+                    out_file=converted_path,
+                    pdf_engine=pdf_engine,
+                    reconvert_existing=regenerate,
+                    echo=click.echo,
+                )
 
             success_count += 1
             file_end = time.perf_counter()
