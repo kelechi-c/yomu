@@ -13,18 +13,14 @@ from openai import OpenAI
 from PIL import Image
 from pypdf import PdfReader
 import click
-try:
-    from .convert2pdf import convert_markdown_file_to_pdf
-except ImportError:
-    from convert2pdf import convert_markdown_file_to_pdf
-
 import dotenv
+from convert2pdf import convert_markdown_file_to_pdf
 
 dotenv.load_dotenv()
 
 
 T = TypeVar("T")
-OCR_CACHE_VERSION = "v1"
+OCR_CACHE_VERSION = "v2"
 DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_PROMPT_FILES = {
     "summary": DEFAULT_PROMPT_DIR / "summary.md",
@@ -46,7 +42,7 @@ def _latency_marker(step_name: str) -> Callable[[Callable[..., T]], Callable[...
             start = time.perf_counter()
             result = func(*args, **kwargs)
             end = time.perf_counter()
-            click.echo(f"  [latency] {step_name}: {_latency_seconds(start, end)}")
+            click.echo(f" [latency] {step_name}: {_latency_seconds(start, end)}")
             return result
 
         return wrapper
@@ -58,7 +54,7 @@ def _timed_call(step_name: str, fn: Callable[..., T], *args: Any, **kwargs: Any)
     start = time.perf_counter()
     result = fn(*args, **kwargs)
     end = time.perf_counter()
-    click.echo(f"  [latency] {step_name}: {_latency_seconds(start, end)}")
+    click.echo(f" [latency] {step_name}: {_latency_seconds(start, end)}")
     return result
 
 
@@ -66,10 +62,16 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _ocr_cache_path(cache_dir: Path, pdf_bytes: bytes, model: str, max_pages: int) -> Path:
+def _ocr_cache_path(
+    cache_dir: Path,
+    pdf_bytes: bytes,
+    model: str,
+    max_pages: int,
+    batch_size: int,
+) -> Path:
     model_key = re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_") or "model"
     file_hash = _sha256_hex(pdf_bytes)
-    cache_key = f"{file_hash}_{model_key}_p{max_pages}_{OCR_CACHE_VERSION}"
+    cache_key = f"{file_hash}_{model_key}_p{max_pages}_b{batch_size}_{OCR_CACHE_VERSION}"
     return cache_dir / f"{cache_key}.txt"
 
 
@@ -80,7 +82,7 @@ def _read_cached_ocr(path: Path) -> str | None:
     return text or None
 
 
-@_latency_marker("native_text_extraction")
+# @_latency_marker("native_text_extraction")
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     chunks: List[str] = []
@@ -101,48 +103,107 @@ def _render_pdf_pages(pdf_bytes: bytes, max_pages: int = 60) -> List[Image.Image
     return images
 
 
+def _image_to_base64_jpeg(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def _extract_batched_page_text(raw_text: str, expected_pages: List[int]) -> List[str]:
+    normalized = raw_text.strip()
+    if not normalized:
+        return []
+
+    pattern = re.compile(
+        r"(?ms)^\[Page\s+(\d+)\]\s*\n(.*?)(?=^\[Page\s+\d+\]\s*\n|\Z)"
+    )
+    matches = list(pattern.finditer(normalized))
+    if matches:
+        page_to_text: dict[int, str] = {}
+        for match in matches:
+            page_num = int(match.group(1))
+            page_text = match.group(2).strip()
+            if page_text and page_num not in page_to_text:
+                page_to_text[page_num] = page_text
+
+        chunks: List[str] = []
+        for page_num in expected_pages:
+            page_text = page_to_text.get(page_num)
+            if page_text:
+                chunks.append(f"\n[Page {page_num}]\n{page_text}")
+        if chunks:
+            return chunks
+
+    if len(expected_pages) == 1:
+        return [f"\n[Page {expected_pages[0]}]\n{normalized}"]
+
+    return [f"\n[Pages {expected_pages[0]}-{expected_pages[-1]}]\n{normalized}"]
+
+
 @_latency_marker("ocr_fallback")
-def _ocr_with_model(client: OpenAI, model: str, pdf_bytes: bytes, max_pages: int) -> str:
+def _ocr_with_model(
+    client: OpenAI,
+    model: str,
+    pdf_bytes: bytes,
+    max_pages: int,
+    batch_size: int,
+) -> str:
     pages = _render_pdf_pages(pdf_bytes, max_pages=max_pages)
     chunks: List[str] = []
-    for idx, image in enumerate(pages, start=1):
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="JPEG")
-        image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    batch_size = max(1, batch_size)
+
+    for batch_start in range(0, len(pages), batch_size):
+        batch_pages = pages[batch_start : batch_start + batch_size]
+        expected_page_nums = list(
+            range(batch_start + 1, batch_start + len(batch_pages) + 1)
+        )
+        page_map = "\n".join(
+            f"- image {i + 1} => page {page_num}"
+            for i, page_num in enumerate(expected_page_nums)
+        )
+
+        content: List[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "You will receive one or more lecture page images in order. "
+                    "Extract all readable text from each page exactly as written. "
+                    "Preserve headings and bullet structure when possible.\n\n"
+                    "Page mapping for this request:\n"
+                    f"{page_map}\n\n"
+                    "Return plain text only and use this exact structure for every page:\n"
+                    "[Page <absolute_page_number>]\n"
+                    "<transcribed text>"
+                ),
+            }
+        ]
+
+        for image in batch_pages:
+            image_b64 = _image_to_base64_jpeg(image)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                }
+            )
+
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Extract all readable text from this lecture page image exactly "
-                                "as written. Preserve headings and bullet structure when possible. "
-                                "Return plain text only."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
-        text = _completion_to_text(response)
-        if text:
-            chunks.append(f"\n[Page {idx}]\n{text}")
+        batch_text = _completion_to_text(response)
+        if batch_text:
+            chunks.extend(_extract_batched_page_text(batch_text, expected_page_nums))
+
     return "\n".join(chunks).strip()
 
 
-@_latency_marker("prompt_load")
+# @_latency_marker("prompt_load")
 def _load_prompt_template(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-@_latency_marker("prompt_build")
+# @_latency_marker("prompt_build")
 def _build_prompt(template: str, material_text: str, difficulty: str) -> str:
     rendered = template
     rendered = rendered.replace("{{difficulty}}", difficulty)
@@ -181,7 +242,7 @@ def _strip_markdown_bold(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"\1", text)
 
 
-@_latency_marker("markdown_render")
+# @_latency_marker("markdown_render")
 def _summary_to_markdown(title: str, content: str) -> str:
     normalized_title = _strip_markdown_bold(title).strip()
     lines: List[str] = [f"# {normalized_title}", ""]
@@ -203,11 +264,22 @@ def _load_env_file_if_present(env_path: Path) -> None:
             os.environ[key] = value
 
 
-def _normalized_output_name(pdf_stem: str, prompt_type: str) -> str:
-    normalized_stem = re.sub(r"[^a-z0-9]+", "_", pdf_stem.lower()).strip("_")
-    normalized_stem = normalized_stem or "untitled"
-    prompt_suffix = re.sub(r"[^a-z0-9]+", "_", prompt_type.lower()).strip("_") or "output"
-    return f"{normalized_stem}_{prompt_suffix}.md"
+def _normalize_name_segment(value: str, fallback: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalized or fallback
+
+
+def _normalized_output_name(
+    pdf_stem: str,
+    prompt_type: str,
+    name_suffix: str | None = None,
+) -> str:
+    normalized_stem = _normalize_name_segment(pdf_stem, "untitled")
+    prompt_suffix = _normalize_name_segment(prompt_type, "output")
+    parts = [normalized_stem, prompt_suffix]
+    if name_suffix:
+        parts.append(_normalize_name_segment(name_suffix, "tag"))
+    return f"{'_'.join(parts)}.md"
 
 
 def _resolve_prompt_file(prompt_type: str, prompt_file: Path | None) -> Path:
@@ -288,6 +360,13 @@ def _output_title_for_prompt_type(prompt_type: str, source_name: str) -> str:
     help="Directory for persistent OCR cache across sessions.",
 )
 @click.option(
+    "--ocr-batch-size",
+    default=8,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Number of rendered pages sent per OCR model request.",
+)
+@click.option(
     "--regenerate",
     is_flag=True,
     default=False,
@@ -334,6 +413,14 @@ def _output_title_for_prompt_type(prompt_type: str, source_name: str) -> str:
     type=click.Choice(["low", "medium", "high"], case_sensitive=False),
     help="Difficulty used by prompt templates that include {{difficulty}}.",
 )
+@click.option(
+    "--name-suffix",
+    default=None,
+    help=(
+        "Optional suffix/tag appended to generated markdown and PDF filenames, "
+        "for example 'v2' or 'midterm-review'."
+    ),
+)
 def main(
     input_dir: Path,
     output_dir: Path,
@@ -344,6 +431,7 @@ def main(
     max_ocr_pages: int,
     ocr_threshold: int,
     ocr_cache_dir: Path,
+    ocr_batch_size: int,
     regenerate: bool,
     convert_md_to_pdf: bool,
     pdf_output_dir: Path | None,
@@ -351,6 +439,7 @@ def main(
     prompt_type: str,
     prompt_file: Path | None,
     difficulty: str,
+    name_suffix: str | None,
 ) -> None:
     run_start = time.perf_counter()
     _load_env_file_if_present(Path(".env"))
@@ -392,6 +481,7 @@ def main(
     click.echo(f"found {total} pdf file(s) in {input_dir}")
     click.echo(f"output path -> {output_dir}")
     click.echo(f"ocr cache path -> {ocr_cache_dir}")
+    click.echo(f"ocr batch size: {ocr_batch_size}")
     click.echo(f"llm id: {model}")
     click.echo(f"base url: {base_url or '(default openai)'}")
     click.echo(f"regenerate: {regenerate}")
@@ -402,12 +492,17 @@ def main(
     click.echo(f"prompt type: {prompt_type.lower()}")
     click.echo(f"prompt file: {resolved_prompt_file}")
     click.echo(f"difficulty: {difficulty.lower()}")
+    click.echo(f"name suffix: {name_suffix or '(none)'}")
 
     for idx, pdf_path in enumerate(pdf_paths, start=1):
         file_start = time.perf_counter()
         click.echo(f"\n[{idx}/{total}] preprocessing: {pdf_path.name}")
         try:
-            out_filename = _normalized_output_name(pdf_path.stem, prompt_type.lower())
+            out_filename = _normalized_output_name(
+                pdf_path.stem,
+                prompt_type.lower(),
+                name_suffix=name_suffix,
+            )
             out_path = output_dir / out_filename
             md_exists = out_path.exists()
             if md_exists and not regenerate:
@@ -419,31 +514,43 @@ def main(
                         "Missing API key. Set OPENAI_API_KEY/GEMINI_API_KEY or pass --api-key."
                     )
                 # if client is None:
-                
+
                 # print(base_url, api_key)
-                
+
                 client = OpenAI(
                     api_key=api_key, base_url=base_url,
                 )
 
-                pdf_bytes = _timed_call("read_pdf_bytes", pdf_path.read_bytes)
+                pdf_bytes = pdf_path.read_bytes()
+                # pdf_bytes = _timed_call("read_pdf_bytes", pdf_path.read_bytes)
                 material_text = _extract_pdf_text(pdf_bytes)
 
                 if len(material_text) < ocr_threshold:
                     click.echo("native text is low; running OCR fallback with model...")
-                    cache_path = _ocr_cache_path(ocr_cache_dir, pdf_bytes, model, max_ocr_pages)
-                    cached_ocr_text = _timed_call("ocr_cache_lookup", _read_cached_ocr, cache_path)
+                    cache_path = _ocr_cache_path(
+                        ocr_cache_dir,
+                        pdf_bytes,
+                        model,
+                        max_ocr_pages,
+                        ocr_batch_size,
+                    )
+                    cached_ocr_text = _read_cached_ocr(cache_path) #_timed_call("ocr_cache_lookup", )
 
                     if cached_ocr_text:
-                        click.echo("  using cached ocr text")
+                        click.echo("using cached ocr text")
                         material_text = cached_ocr_text
                     else:
                         material_text = _ocr_with_model(
-                            client, model, pdf_bytes, max_pages=max_ocr_pages
+                            client,
+                            model,
+                            pdf_bytes,
+                            max_pages=max_ocr_pages,
+                            batch_size=ocr_batch_size,
                         )
-                        _timed_call(
-                            "ocr_cache_write", cache_path.write_text, material_text, "utf-8"
-                        )
+                        cache_path.write_text(material_text, "utf-8")
+                        # _timed_call(
+                        #     "ocr_cache_write",
+                        # )
 
                 if not material_text:
                     raise ValueError("Could not extract readable text from PDF.")
@@ -457,7 +564,8 @@ def main(
 
                 output_title = _output_title_for_prompt_type(prompt_type.lower(), pdf_path.name)
                 output_markdown = _summary_to_markdown(output_title, summary_text)
-                _timed_call("write_markdown", out_path.write_text, output_markdown, "utf-8")
+                out_path.write_text(output_markdown, encoding="utf-8")
+                # _timed_call("write_markdown", , output_markdown, "utf-8")
                 click.echo(f"saved => {out_path}")
 
             if convert_md_to_pdf:
@@ -465,9 +573,8 @@ def main(
                     raise ValueError(f"Markdown file is not available for conversion: {out_path}")
                 assert resolved_pdf_output_dir is not None
                 converted_path = resolved_pdf_output_dir / f"{out_path.stem}.pdf"
-                _timed_call(
-                    "md_to_pdf",
-                    convert_markdown_file_to_pdf,
+                # _timed_call("md_to_pdf",
+                convert_markdown_file_to_pdf(
                     md_file=out_path,
                     out_file=converted_path,
                     pdf_engine=pdf_engine,
