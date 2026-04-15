@@ -45,6 +45,8 @@ uv run python yomu.py \
   --name-suffix qwen_v1 # just as a version tag
 ```
 
+you could make also just your changes to `summary_ex.sh` to match your environment
+
 major options:
 
 - `--prompt-type` supports `summary`, `questions`, `mcq_100`, `theory_5_applied`, and `theory_5_direct`
@@ -52,14 +54,15 @@ major options:
 - `--regenerate` forces regeneration when an output markdown file already exists
 - `--max-files 0` processes all PDFs in the input directory
 - `--prompt-file path/to/prompt.md` uses a custom prompt template (if you make yours)
-
-note that I have only tested the summary prompts thoroughly, the question paths are undefined. 
-
-**NB**: You need to have openrouter credits if using Openrouter models.
-contributions are highly welcome as well. 
-
-See all options via...
+see all options via...
 
 ```bash
 uv run python yomu.py --help
 ```
+
+## important notes
+- You need to have openrouter credits if using Openrouter models; even the free openrouter models are rate-limited.
+- `Qwen3.5-27b` or `Qwen3.5-35b-a3b` is the preferred model, highly recommended by me, for cost-quality ratio.
+- majority of the code is proudly written by OpenAI's Codex, and tweaked/refined by me
+- contributions are highly welcome as well. 
+- note that I have only tested the summary prompts thoroughly, the question prompts are unrefined. you can also pass yout own prompt file if necessary
