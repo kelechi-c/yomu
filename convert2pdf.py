@@ -26,6 +26,7 @@ def normalize_markdown(md_text: str) -> str:
     return "\n".join(out) + "\n"
 
 
+# Convert one markdown file to PDF via pandoc.
 def convert_markdown_file_to_pdf(
     md_file: Path,
     out_file: Path,
@@ -33,10 +34,6 @@ def convert_markdown_file_to_pdf(
     reconvert_existing: bool = False,
     echo: Callable[[str], None] | None = None,
 ) -> bool:
-    """Convert one markdown file to PDF via pandoc.
-
-    Returns True when converted, False when skipped because output exists.
-    """
     log = echo or (lambda _: None)
     md_file = md_file.expanduser().resolve()
     out_file = out_file.expanduser().resolve()
@@ -69,6 +66,7 @@ def convert_markdown_file_to_pdf(
             temp_md.unlink()
 
 
+# Convert all markdown files in a directory to PDF.
 def convert_markdown_dir_to_pdf(
     input_dir: Path,
     output_dir: Path | None = None,
@@ -76,10 +74,7 @@ def convert_markdown_dir_to_pdf(
     reconvert_existing: bool = False,
     echo: Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
-    """Convert all markdown files in a directory to PDF.
 
-    Returns (converted_count, skipped_count).
-    """
     log = echo or click.echo
     input_dir = input_dir.expanduser().resolve()
     output_dir = (output_dir or (input_dir / "pdfs")).expanduser().resolve()
