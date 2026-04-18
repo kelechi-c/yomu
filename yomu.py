@@ -65,14 +65,39 @@ def _sha256_hex(data: bytes) -> str:
 def _ocr_cache_path(
     cache_dir: Path,
     pdf_bytes: bytes,
-    model: str,
     max_pages: int,
     batch_size: int,
 ) -> Path:
-    model_key = re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_") or "model"
     file_hash = _sha256_hex(pdf_bytes)
-    cache_key = f"{file_hash}_{model_key}_p{max_pages}_b{batch_size}_{OCR_CACHE_VERSION}"
+    cache_key = (
+        f"{file_hash}_p{max_pages}_b{batch_size}_{OCR_CACHE_VERSION}"
+    )
     return cache_dir / f"{cache_key}.txt"
+
+
+def _legacy_ocr_cache_candidates(
+    cache_dir: Path,
+    pdf_bytes: bytes,
+    max_pages: int,
+    batch_size: int,
+) -> List[Path]:
+    file_hash = _sha256_hex(pdf_bytes)
+    patterns = [
+        f"{file_hash}_*_p{max_pages}_b{batch_size}_{OCR_CACHE_VERSION}.txt",
+        f"{file_hash}_*_p{max_pages}_v1.txt",
+    ]
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for path in sorted(
+            cache_dir.glob(pattern),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        ):
+            if path not in seen:
+                candidates.append(path)
+                seen.add(path)
+    return candidates
 
 
 def _read_cached_ocr(path: Path) -> str | None:
@@ -80,6 +105,32 @@ def _read_cached_ocr(path: Path) -> str | None:
         return None
     text = path.read_text(encoding="utf-8").strip()
     return text or None
+
+
+def _load_cached_ocr(
+    canonical_path: Path,
+    cache_dir: Path,
+    pdf_bytes: bytes,
+    max_pages: int,
+    batch_size: int,
+) -> tuple[str | None, Path | None]:
+    cached_text = _read_cached_ocr(canonical_path)
+    if cached_text:
+        return cached_text, canonical_path
+
+    for legacy_path in _legacy_ocr_cache_candidates(
+        cache_dir,
+        pdf_bytes,
+        max_pages,
+        batch_size,
+    ):
+        cached_text = _read_cached_ocr(legacy_path)
+        if cached_text:
+            if legacy_path != canonical_path and not canonical_path.exists():
+                canonical_path.write_text(cached_text, encoding="utf-8")
+            return cached_text, legacy_path
+
+    return None, None
 
 
 # @_latency_marker("native_text_extraction")
@@ -526,20 +577,31 @@ def main(
                 material_text = _extract_pdf_text(pdf_bytes)
 
                 if len(material_text) < ocr_threshold:
-                    click.echo("native text is low; running OCR fallback with model...")
+                    click.echo("native text is low")
                     cache_path = _ocr_cache_path(
                         ocr_cache_dir,
                         pdf_bytes,
-                        model,
                         max_ocr_pages,
                         ocr_batch_size,
                     )
-                    cached_ocr_text = _read_cached_ocr(cache_path) #_timed_call("ocr_cache_lookup", )
+                    cached_ocr_text, cache_hit_path = _load_cached_ocr(
+                        cache_path,
+                        ocr_cache_dir,
+                        pdf_bytes,
+                        max_ocr_pages,
+                        ocr_batch_size,
+                    )
 
                     if cached_ocr_text:
-                        click.echo("using cached ocr text")
+                        if cache_hit_path == cache_path:
+                            click.echo("using shared ocr cache")
+                        else:
+                            click.echo(
+                                f"using legacy ocr cache and promoting it -> {cache_path.name}"
+                            )
                         material_text = cached_ocr_text
                     else:
+                        click.echo("running OCR fallback")
                         material_text = _ocr_with_model(
                             client,
                             model,
